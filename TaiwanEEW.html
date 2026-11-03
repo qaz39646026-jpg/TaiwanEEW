@@ -1,0 +1,238 @@
+<!DOCTYPE html>
+<html lang="zh-Hant">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>RF-Monitor | 地震速報通知</title>
+
+  <link href="https://api.mapbox.com/mapbox-gl-js/v2.8.2/mapbox-gl.css" rel="stylesheet" />
+  <script src="https://api.mapbox.com/mapbox-gl-js/v2.8.2/mapbox-gl.js"></script>
+  
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    html, body, #map { width: 100%; height: 100%; }
+    #map { height: 100vh; }
+    .epicenter-marker {
+      font-size: 32px; font-weight: bold; line-height: 1;
+      text-shadow: 2px 2px 4px rgba(0,0,0,0.9); cursor: default;
+    }
+    .mapboxgl-ctrl-group { -webkit-filter: invert(100%); }
+    
+    /* 授權按鈕 */
+    #notify-btn {
+      position: absolute; top: 20px; left: 50%; transform: translateX(-50%);
+      z-index: 9999; padding: 12px 24px; background: #c00; color: white;
+      border: 2px solid #fff; border-radius: 8px; font-weight: bold; font-size: 16px;
+      box-shadow: 0 4px 10px rgba(0,0,0,0.5); cursor: pointer; display: none;
+    }
+  </style>
+</head>
+<body>
+  <div id="map"></div>
+  
+  <!-- 通知權限按鈕（因為放在 https，這個按鈕按下去才能跳出系統允許視窗） -->
+  <button id="notify-btn">👉 點我開啟地震通知</button>
+
+  <script>
+    // ==========================================
+    // 1. Mapbox 初始化
+    // ==========================================
+    mapboxgl.accessToken = 'pk.eyJ1IjoicHBxdWFrZSIsImEiOiJja3pwOXd2Z2w1eTBkMnFwcnc5c3ByYjJqIn0.EWTHDE0h0a100w8qbrf5Rg';
+    const map = new mapboxgl.Map({
+      container: 'map',
+      style: 'mapbox://styles/ppquake/ckzr7jkiu002a14pa4beb6mno',
+      center: [121.02, 24.80],
+      zoom: 6
+    });
+
+    let currentMarker = null;
+    let countiesGeoJSON = null;
+    const GEOJSON_CDN_URL = 'https://fastly.jsdelivr.net/gh/g0v/twgeojson@master/json/twCounty2010.geo.json';
+
+    const INTENSITY_COLORS = {
+      '0': '#000000', '1': '#0000FF', '2': '#00AEEF', '3': '#00A651',
+      '4': '#FFC20E', '5弱': '#F7941D', '5強': '#F26522',
+      '6弱': '#ED1C24', '6強': '#A3141A', '7': '#B61EEB', '預設': '#FF0000'
+    };
+    const INTENSITY_VALUE = {
+      '0': 0, '1': 1, '2': 2, '3': 3, '4': 4, '5弱': 4.5, '5': 5, '5強': 5.5, '6弱': 5.5, '6': 6, '6強': 6.5, '7': 7
+    };
+
+    function normName(s) { return (s || '').replace(/臺/g, '台').replace(/\s/g, '').trim(); }
+
+    // ==========================================
+    // 2. 通知權限處理與系統推播
+    // ==========================================
+    const notifyBtn = document.getElementById('notify-btn');
+
+    // 檢查是否支援通知
+    if ('Notification' in window) {
+      if (Notification.permission === 'default') {
+        notifyBtn.style.display = 'block'; // 顯示按鈕讓用戶點擊
+      } else if (Notification.permission === 'granted') {
+        notifyBtn.style.display = 'none'; // 已經允許過，隱藏按鈕
+      }
+
+      notifyBtn.addEventListener('click', () => {
+        Notification.requestPermission().then(permission => {
+          if (permission === 'granted') {
+            notifyBtn.style.display = 'none';
+            new Notification('✅ 設定成功', { 
+              body: '地震速報通知已開啟！地震來臨時會在此通知。',
+              icon: 'https://upload.wikimedia.org/wikipedia/commons/thumb/1/1a/ROC_Central_Weather_Bureau_Logo.svg/200px-ROC_Central_Weather_Bureau_Logo.svg.png'
+            });
+          } else {
+            alert('你拒絕了通知權限，將無法在通知欄收到警報。');
+          }
+        });
+      });
+    }
+
+    // 發送系統通知欄推播的函式
+    function sendSystemNotification(maxIntensity) {
+      if (!('Notification' in window) || Notification.permission !== 'granted') return;
+
+      const title = `🚨 地震速報！最大震度 ${maxIntensity} 級`;
+      const options = {
+        body: '請立即採取抗震保命三步驟：趴下、掩護、穩住。',
+        icon: 'https://upload.wikimedia.org/wikipedia/commons/thumb/1/1a/ROC_Central_Weather_Bureau_Logo.svg/200px-ROC_Central_Weather_Bureau_Logo.svg.png',
+        vibrate: [500, 200, 500, 200, 500],
+        requireInteraction: true // 讓通知停留在通知欄，不會自動消失
+      };
+
+      new Notification(title, options);
+    }
+
+    // ==========================================
+    // 3. 地圖更新核心
+    // ==========================================
+    function updateMapView(lng, lat, maxIntensity, countyIntensity = {}) {
+      if (lng == null || lat == null) return;
+
+      const color = INTENSITY_COLORS[maxIntensity] || INTENSITY_COLORS['預設'];
+      if (currentMarker) currentMarker.remove();
+
+      const el = document.createElement('div');
+      el.className = 'epicenter-marker';
+      el.textContent = '✕';
+      el.style.color = color;
+
+      currentMarker = new mapboxgl.Marker({ element: el }).setLngLat([lng, lat]).addTo(map);
+
+      if (!countiesGeoJSON || !map.getSource('counties')) return;
+
+      const lookup = {};
+      Object.keys(countyIntensity).forEach(name => {
+        lookup[normName(name)] = INTENSITY_COLORS[countyIntensity[name]] || INTENSITY_COLORS['預設'];
+      });
+
+      let updatedGeoJSON = JSON.parse(JSON.stringify(countiesGeoJSON));
+      updatedGeoJSON.features.forEach(f => {
+        const p = f.properties || {};
+        const name = p.COUNTYNAME || p.COUNTY_NAME || p.CountyName || p.name || p.NAME || '';
+        f.properties._intensityColor = lookup[normName(name)] || 'rgba(0,0,0,0)';
+      });
+      map.getSource('counties').setData(updatedGeoJSON);
+    }
+
+    // ==========================================
+    // 4. CWA 歷史地震
+    // ==========================================
+    async function fetchCwaHistory() {
+      const CWA_API_URL = 'https://opendata.cwa.gov.tw/api/v1/rest/datastore/E-A0015-001';
+      const CWA_TOKEN = 'CWA-0116F88C-1D29-438F-A99F-4237FE4923B0';
+      try {
+        const res = await fetch(`${CWA_API_URL}?Authorization=${CWA_TOKEN}&format=JSON`);
+        const data = await res.json();
+        const quake = data?.records?.Earthquake?.[0];
+        if (!quake) return;
+        const ep = quake.EarthquakeInfo?.Epicenter;
+        if (!ep) return;
+
+        const countyIntensity = {};
+        let maxLabel = '預設', maxVal = -1;
+
+        const areas = quake.Intensity?.ShakingArea || [];
+        areas.forEach(area => {
+          const county = area.CountyName;
+          const label = (area.AreaIntensity || '').replace(/[級级]/g, '').trim();
+          if (!county) return;
+          const val = INTENSITY_VALUE[label] ?? -1;
+          if (!(county in countyIntensity) || val > (INTENSITY_VALUE[countyIntensity[county]] || -1)) countyIntensity[county] = label;
+          if (val > maxVal) { maxVal = val; maxLabel = label; }
+        });
+
+        updateMapView(ep.EpicenterLongitude, ep.EpicenterLatitude, maxLabel, countyIntensity);
+      } catch (err) { console.error('取得歷史地震失敗:', err); }
+    }
+
+    // ==========================================
+    // 5. WebSocket 即時速報
+    // ==========================================
+    function connectEewWebSocket() {
+      const ws = new WebSocket('wss://rptes.com:443/ws/');
+      ws.onmessage = (event) => {
+        try {
+          const data = JSON.parse(event.data);
+          if (data.isCancel || data.isCanceled || data.cancel || data.type === 'cancel') return;
+          
+          const eq = data.earthquake || data.data || data;
+          const lat = eq.lat ?? eq.latitude ?? eq.Latitude;
+          const lng = eq.lng ?? eq.lon ?? eq.longitude ?? eq.Longitude;
+          const maxIntensity = eq.maxIntensity ?? eq.MaxIntensity ?? eq.intensity ?? eq.shindo ?? eq.max_intensity ?? '未知';
+          if (lat == null || lng == null) return;
+
+          // 觸發系統通知欄推播
+          sendSystemNotification(maxIntensity);
+
+          // 更新地圖
+          const countyIntensity = {};
+          const areaList = eq.area || eq.shindo_area || eq.areas;
+          if (areaList) {
+            if (Array.isArray(areaList)) {
+              areaList.forEach(item => {
+                const name = item.name || item.countyName || item.county;
+                const intLabel = item.intensity || item.shindo || item.value;
+                if (name && intLabel) countyIntensity[name] = String(intLabel).replace(/[級级]/g, '').trim();
+              });
+            } else if (typeof areaList === 'object') {
+              Object.keys(areaList).forEach(name => {
+                countyIntensity[name] = String(areaList[name]).replace(/[級级]/g, '').trim();
+              });
+            }
+          }
+          updateMapView(lng, lat, maxIntensity, countyIntensity);
+        } catch (err) { console.error('解析速報失敗:', err); }
+      };
+      ws.onclose = () => { setTimeout(connectEewWebSocket, 5000); };
+    }
+
+    // ==========================================
+    // 6. 初始化載入
+    // ==========================================
+    map.on('load', async () => {
+      try {
+        const res = await fetch(GEOJSON_CDN_URL);
+        countiesGeoJSON = await res.json();
+        countiesGeoJSON.features.forEach(f => { f.properties._intensityColor = 'rgba(0,0,0,0)'; });
+        map.addSource('counties', { type: 'geojson', data: countiesGeoJSON });
+
+        const firstSymbol = map.getStyle().layers.find(l => l.type === 'symbol');
+        const fillLayer = {
+          id: 'counties-intensity-fill', type: 'fill', source: 'counties',
+          paint: {
+            'fill-color': ['get', '_intensityColor'],
+            'fill-opacity': ['case', ['!=', ['get', '_intensityColor'], 'rgba(0,0,0,0)'], 0.55, 0]
+          }
+        };
+        if (firstSymbol) map.addLayer(fillLayer, firstSymbol.id);
+        else map.addLayer(fillLayer);
+      } catch (err) { console.error('載入邊界失敗:', err); }
+      finally {
+        fetchCwaHistory();
+        connectEewWebSocket();
+      }
+    });
+  </script>
+</body>
+</html>
